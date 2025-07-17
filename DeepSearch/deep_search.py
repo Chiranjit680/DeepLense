@@ -75,21 +75,60 @@ class FashionDataset(Dataset):
             if self.transform:
                 default_image = self.transform(default_image)
             return default_image, img_path, self.labels.iloc[idx]
-Fashion_dataset = FashionDataset(root_dir='content/fashion_subset', label_file='styles.csv')
-FashionDataLoader = DataLoader(Fashion_dataset, batch_size=32, shuffle=True)
+
+# Global dataset and dataloader - only create when explicitly requested
+Fashion_dataset = None
+FashionDataLoader = None
+
+def get_dataset():
+    """Get or create the global dataset"""
+    global Fashion_dataset, FashionDataLoader
+    if Fashion_dataset is None:
+        initialize_dataset()
+    return Fashion_dataset, FashionDataLoader
+
+def initialize_dataset():
+    """Initialize the global dataset and dataloader"""
+    global Fashion_dataset, FashionDataLoader
+    try:
+        # Correct paths based on the actual file structure
+        # From DeepSearch folder: go up to DeepLense, then up to root, then to content/fashion_subset
+        root_dir = os.path.join('..', '..', '..', 'content', 'fashion_subset')
+        # From DeepSearch folder: go up to DeepLense for styles.csv
+        label_file = os.path.join('..', 'styles.csv')
+        
+        print(f"Trying to initialize dataset with:")
+        print(f"  Root dir: {os.path.abspath(root_dir)}")
+        print(f"  Label file: {os.path.abspath(label_file)}")
+        
+        Fashion_dataset = FashionDataset(root_dir=root_dir, label_file=label_file)
+        FashionDataLoader = DataLoader(Fashion_dataset, batch_size=32, shuffle=True)
+        print("✅ Dataset initialized successfully")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not initialize global dataset: {e}")
+        print("💡 This is normal for API usage - dataset not needed for inference")
+
 class FeatureExtractor:
     def __init__(self, model_name='vgg16', pretrained=True):
         self.model_name = model_name
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         if model_name == 'vgg16':
-            self.model = models.vgg16(pretrained=pretrained)
+            # Use the newer weights parameter to avoid deprecation warnings
+            if pretrained:
+                self.model = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
+            else:
+                self.model = models.vgg16(weights=None)
             # Remove the classifier (last layer) and adaptive pooling
             self.extractor = torch.nn.Sequential(*list(self.model.features))
             # Add adaptive pooling to ensure consistent output size
             self.extractor.add_module('adaptive_pool', torch.nn.AdaptiveAvgPool2d((7, 7)))
         elif model_name == 'resnet50':
-            self.model = models.resnet50(pretrained=pretrained)
+            # Use the newer weights parameter
+            if pretrained:
+                self.model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+            else:
+                self.model = models.resnet50(weights=None)
             # Remove the last fully connected layer
             self.extractor = torch.nn.Sequential(*list(self.model.children())[:-1])
         
@@ -111,6 +150,21 @@ class FeatureExtractor:
                 file_names.extend(file_paths)
                 labels.extend(batch_labels)
         return embeddings, file_names, labels
+    
+    def extract_features_single(self, image_tensor):
+        """Extract features from a single image tensor"""
+        with torch.no_grad():
+            # Ensure image is on the correct device
+            if image_tensor.device != self.device:
+                image_tensor = image_tensor.to(self.device)
+            
+            # Extract features
+            features = self.extractor(image_tensor)
+            features = features.view(features.size(0), -1)
+            
+            # Return CPU tensor for compatibility with FAISS
+            return features.cpu()
+
     def save_embeddings(self, embeddings, file_names, labels, output_file='embeddings.csv'):
         torch.save({
             'embeddings': embeddings,
@@ -119,9 +173,18 @@ class FeatureExtractor:
         }, output_file)
 
 def main():
+    """Main function to extract and save embeddings"""
+    # Get dataset (will initialize if needed)
+    dataset, dataloader = get_dataset()
+    
+    if dataset is None or dataloader is None:
+        print("❌ Could not initialize dataset. Please check file paths.")
+        return
+    
     feature_extractor = FeatureExtractor(model_name='vgg16', pretrained=True)
-    embeddings, file_names, labels = feature_extractor.extract_features(FashionDataLoader)
+    embeddings, file_names, labels = feature_extractor.extract_features(dataloader)
     embeddings = torch.cat(embeddings, dim=0).cpu().numpy()
     feature_extractor.save_embeddings(embeddings, file_names, labels, output_file='embeddings.pth')
+
 if __name__ == "__main__":
     main()
